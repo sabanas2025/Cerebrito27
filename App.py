@@ -23,6 +23,19 @@ logging.basicConfig(
         logging.FileHandler('app.log')
     ]
 )
+import logging
+import os
+from datetime import datetime
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('app.log')
+    ]
+)
 
 # Variables de entorno
 DB_USERS = os.getenv('DB_USERS', 'users_v19.db')
@@ -245,6 +258,32 @@ def analysis_page(user):
     st.title("📊 Análisis de Datos")
     
     uploaded = st.file_uploader("📂 Sube Excel", type=['xlsx','xls'])
+    
+    if uploaded:
+        try:
+            # Validar el tamaño del archivo
+            file_size = uploaded.size
+            if file_size > 10 * 1024 * 1024:  # 10MB límite
+                st.error("❌ El archivo es demasiado grande. Máximo 10MB permitido.")
+                return
+            
+            # Leer el archivo Excel con manejo de errores
+            df = pd.read_excel(uploaded)
+            
+            # Validar que hay datos
+            if df.empty:
+                st.error("❌ El archivo Excel está vacío")
+                return
+            
+            # Verificar columnas mínimas necesarias
+            if len(df.columns) < 2:
+                st.error("❌ El archivo debe tener al menos 2 columnas")
+                return
+            
+            st.success(f"✅ {len(df)} registros cargados")
+            
+            first_row = st.number_input("Primera fila de datos", 0, len(df)-1, 0)
+            df = df.iloc[first_row:].reset_index(drop=True)
     
         if uploaded:
             try:
