@@ -18,19 +18,49 @@ DB_INFONAVIT = "infonavit.db"
 
 # ==================== BASE DE DATOS ====================
 def init_db():
-    conn = sqlite3.connect(DB_USERS)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username TEXT UNIQUE,
-        password TEXT,
-        email TEXT,
-        credits INTEGER DEFAULT 10,
-        is_admin INTEGER DEFAULT 0,
-        is_confirmed INTEGER DEFAULT 0,
-        confirmation_code TEXT,
-        logo BLOB
-    )''')
+    try:
+        conn = sqlite3.connect(DB_USERS)
+        c = conn.cursor()
+        
+        # Agregar nuevos campos y mejoras de seguridad
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT UNIQUE,
+            password TEXT,
+            email TEXT,
+            credits INTEGER DEFAULT 10,
+            is_admin INTEGER DEFAULT 0,
+            is_confirmed INTEGER DEFAULT 0,
+            confirmation_code TEXT,
+            logo BLOB,
+            salt TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_login DATETIME,
+            failed_attempts INTEGER DEFAULT 0,
+            locked_until DATETIME
+        )''')
+        
+        # Verificar admin por defecto
+        c.execute("SELECT * FROM users WHERE username='admin'")
+        if not c.fetchone():
+            salt = secrets.token_hex(16)
+            admin_pass = hashlib.sha256(("1234" + salt).encode()).hexdigest()
+            c.execute("""
+                INSERT INTO users 
+                (username, password, email, credits, is_admin, is_confirmed, salt) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, ("admin", admin_pass, "admin@example.com", 999999, 1, 1, salt))
+        
+        conn.commit()
+    except sqlite3.Error as e:
+        st.error(f"Error en la base de datos: {str(e)}")
+        raise
+    except Exception as e:
+        st.error(f"Error inesperado: {str(e)}")
+        raise
+    finally:
+        if 'conn' in locals():
+            conn.close()
     
     c.execute("SELECT * FROM users WHERE username='admin'")
     if not c.fetchone():
@@ -41,27 +71,51 @@ def init_db():
     conn.close()
 
 def get_user(username):
-    conn = sqlite3.connect(DB_USERS)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE username=?", (username,))
-    user = c.fetchone()
-    conn.close()
-    return user
+    try:
+        conn = sqlite3.connect(DB_USERS)
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE username=?", (username,))
+        user = c.fetchone()
+        conn.close()
+        return user
+    except sqlite3.Error as e:
+        st.error(f"Error de base de datos: {str(e)}")
+        return None
+    except Exception as e:
+        st.error(f"Error inesperado: {str(e)}")
+        return None
 
 def create_user(username, password, email, credits=10, is_admin=0):
-    conn = sqlite3.connect(DB_USERS)
-    c = conn.cursor()
-    hashed = hashlib.sha256(password.encode()).hexdigest()
-    code = secrets.token_hex(3).upper()
+    if not username or not password or not email:
+        return False, "Todos los campos son obligatorios"
+    
+    if len(password) < 8:
+        return False, "La contraseña debe tener al menos 8 caracteres"
+        
     try:
-        c.execute("INSERT INTO users VALUES (NULL,?,?,?,?,?,0,?,NULL)",
-                  (username, hashed, email, credits, is_admin, code))
+        conn = sqlite3.connect(DB_USERS)
+        c = conn.cursor()
+        # Usar un salt único para cada usuario
+        salt = secrets.token_hex(16)
+        hashed = hashlib.sha256((password + salt).encode()).hexdigest()
+        code = secrets.token_hex(3).upper()
+        
+        c.execute("""
+            INSERT INTO users 
+            (username, password, email, credits, is_admin, is_confirmed, confirmation_code, logo, salt) 
+            VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?)
+        """, (username, hashed, email, credits, is_admin, code, salt))
+        
         conn.commit()
         conn.close()
         return True, code
-    except:
-        conn.close()
-        return False, None
+    except sqlite3.IntegrityError:
+        return False, "El usuario ya existe"
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 def confirm_user(username, code):
     conn = sqlite3.connect(DB_USERS)
@@ -175,11 +229,32 @@ def analysis_page(user):
     
     uploaded = st.file_uploader("📂 Sube Excel", type=['xlsx','xls'])
     
-    if uploaded:
-        df = pd.read_excel(uploaded)
-        st.success(f"✅ {len(df)} registros cargados")
-        
-        first_row = st.number_input("Primera fila de datos", 0, len(df)-1, 0)
+        if uploaded:
+            try:
+                # Validar el tamaño del archivo
+                file_size = uploaded.size
+                if file_size > 10 * 1024 * 1024:  # 10MB límite
+                    st.error("❌ El archivo es demasiado grande. Máximo 10MB permitido.")
+                    return
+                
+                # Leer el archivo Excel con manejo de errores
+                try:
+                    df = pd.read_excel(uploaded)
+                except Exception as e:
+                    st.error(f"❌ Error al leer el archivo Excel: {str(e)}")
+                    return
+                
+                # Validar que hay datos
+                if df.empty:
+                    st.error("❌ El archivo Excel está vacío")
+                    return
+                
+                # Verificar columnas mínimas necesarias
+                if len(df.columns) < 2:
+                    st.error("❌ El archivo debe tener al menos 2 columnas")
+                    return
+                
+                st.success(f"✅ {len(df)} registros cargados")        first_row = st.number_input("Primera fila de datos", 0, len(df)-1, 0)
         df = df.iloc[first_row:].reset_index(drop=True)
         
         st.subheader("⚙️ Configurar Columnas")
@@ -252,25 +327,44 @@ def analysis_page(user):
             
             with tab2:
                 if config['lat'] and config['lon']:
-                    df_map = df_result[[config['lat'], config['lon']]].dropna()
-                    
-                    if len(df_map) > 0:
-                        center_lat = df_map[config['lat']].mean()
-                        center_lon = df_map[config['lon']].mean()
+                    try:
+                        # Convertir coordenadas a números y limpiar datos
+                        df_map = df_result[[config['lat'], config['lon']]].copy()
+                        df_map[config['lat']] = pd.to_numeric(df_map[config['lat']], errors='coerce')
+                        df_map[config['lon']] = pd.to_numeric(df_map[config['lon']], errors='coerce')
                         
-                        m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+                        # Filtrar coordenadas válidas
+                        df_map = df_map[
+                            (df_map[config['lat']].between(-90, 90)) & 
+                            (df_map[config['lon']].between(-180, 180))
+                        ].dropna()
                         
-                        for idx, row in df_map.iterrows():
-                            folium.Marker(
-                                [row[config['lat']], row[config['lon']]],
-                                popup=f"Registro {idx}",
-                                tooltip=f"Click para info"
-                            ).add_to(m)
-                        
-                        st_folium(m, width=800, height=500)
-                        st.session_state.map_created = True
-                    else:
-                        st.warning("⚠️ No hay coordenadas válidas")
+                        if len(df_map) > 0:
+                            center_lat = df_map[config['lat']].mean()
+                            center_lon = df_map[config['lon']].mean()
+                            
+                            m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+                            
+                            for idx, row in df_map.iterrows():
+                                try:
+                                    folium.Marker(
+                                        [float(row[config['lat']]), float(row[config['lon']])],
+                                        popup=f"Registro {idx}",
+                                        tooltip=f"Click para info"
+                                    ).add_to(m)
+                                except Exception as e:
+                                    st.warning(f"⚠️ Error en coordenada {idx}: {str(e)}")
+                                    continue
+                            
+                            st_folium(m, width=800, height=500)
+                            st.session_state.map_created = True
+                            
+                            # Mostrar estadísticas de coordenadas
+                            st.info(f"📍 Coordenadas válidas: {len(df_map)} de {len(df_result)}")
+                        else:
+                            st.warning("⚠️ No hay coordenadas válidas en el rango permitido")
+                    except Exception as e:
+                        st.error(f"❌ Error al procesar coordenadas: {str(e)}")
             
             with tab3:
                 if config['lat'] and config['lon']:
